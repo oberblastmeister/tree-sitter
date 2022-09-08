@@ -1,6 +1,7 @@
 #include <wasmtime.h>
 #include <wasm.h>
 #include <wctype.h>
+#include <string.h>
 #include "tree_sitter/api.h"
 #include "./alloc.h"
 #include "./language.h"
@@ -9,6 +10,7 @@
 #include "./lexer.h"
 #include "./wasm.h"
 #include "./lexer.h"
+#include "./wasm/wasm-stdlib.h"
 
 typedef struct {
   wasmtime_module_t *module;
@@ -41,6 +43,20 @@ struct TSWasmStore {
   Array(LanguageWasmInstance) language_instances;
   uint32_t current_memory_offset;
   uint32_t current_function_table_offset;
+
+  uint32_t new_fn_index;
+  uint32_t delete_fn_index;
+  uint32_t free_fn_index;
+  uint32_t calloc_fn_index;
+  uint32_t realloc_fn_index;
+  uint32_t malloc_fn_index;
+  uint32_t abort_fn_index;
+  uint32_t memchr_fn_index;
+  uint32_t memcmp_fn_index;
+  uint32_t memcpy_fn_index;
+  uint32_t memmove_fn_index;
+  uint32_t strlen_fn_index;
+  uint32_t towupper_fn_index;
 };
 
 typedef Array(char) StringData;
@@ -94,11 +110,19 @@ typedef struct {
   int32_t eof;
 } LexerInWasmMemory;
 
+typedef struct {
+  uint32_t memory_size;
+  uint32_t memory_align;
+  uint32_t table_size;
+  uint32_t table_align;
+} WasmDylinkMemoryInfo;
+
 static volatile uint32_t NEXT_LANGUAGE_ID;
 static const uint32_t LEXER_ADDRESS = 32;
 static const uint32_t LEXER_END_ADDRESS = LEXER_ADDRESS + sizeof(LexerInWasmMemory);
 
 enum FunctionIx {
+  PROC_EXIT_IX,
   LEXER_ADVANCE_IX,
   LEXER_MARK_END_IX,
   LEXER_GET_COLUMN_IX,
@@ -109,6 +133,84 @@ enum FunctionIx {
   ISWALPHA_IX,
   ISWALNUM_IX,
 };
+
+static uint8_t read_u8(const uint8_t **p, const uint8_t *end) {
+  return *(*p)++;
+}
+
+static inline uint64_t read_uleb128(const uint8_t **p, const uint8_t *end) {
+  uint64_t value = 0;
+  unsigned shift = 0;
+  do {
+    if (*p == end)  return UINT64_MAX;
+    value += (uint64_t)(**p & 0x7f) << shift;
+    shift += 7;
+  } while (*((*p)++) >= 128);
+  return value;
+}
+
+static bool parse_wasm_dylink_memory_info(
+  const uint8_t *bytes,
+  size_t length,
+  WasmDylinkMemoryInfo *info
+) {
+  const uint8_t WASM_MAGIC_NUMBER[4] = {0, 'a', 's', 'm'};
+  const uint8_t WASM_VERSION[4] = {1, 0, 0, 0};
+  const uint8_t WASM_CUSTOM_SECTION = 0x0;
+  const uint8_t WASM_DYLINK_MEM_INFO = 0x1;
+
+  const uint8_t *p = bytes;
+  const uint8_t *end = bytes + length;
+
+  if (length < 8) return false;
+  if (memcmp(p, WASM_MAGIC_NUMBER, 4) != 0) return false;
+  p += 4;
+  if (memcmp(p, WASM_VERSION, 4) != 0) return false;
+  p += 4;
+
+  while (p < end) {
+    uint8_t section_id = read_u8(&p, end);
+    uint32_t section_length = read_uleb128(&p, end);
+    const uint8_t *section_end = p + section_length;
+    if (section_end > end) return false;
+
+    if (section_id == WASM_CUSTOM_SECTION) {
+      uint32_t name_length = read_uleb128(&p, section_end);
+      const uint8_t *name_end = p + name_length;
+      if (name_end > section_end) return false;
+
+      if (name_length == 8 && memcmp(p, "dylink.0", 8) == 0) {
+        p = name_end;
+        while (p < section_end) {
+          uint8_t subsection_type = read_u8(&p, section_end);
+          uint32_t subsection_size = read_uleb128(&p, section_end);
+          const uint8_t *subsection_end = p + subsection_size;
+          if (subsection_end > section_end) return false;
+          if (subsection_type == WASM_DYLINK_MEM_INFO) {
+            info->memory_size = read_uleb128(&p, subsection_end);
+            info->memory_align = read_uleb128(&p, subsection_end);
+            info->table_size = read_uleb128(&p, subsection_end);
+            info->table_align = read_uleb128(&p, subsection_end);
+            return true;
+          }
+          p = subsection_end;
+        }
+      }
+    }
+    p = section_end;
+  }
+  return false;
+}
+
+static wasm_trap_t *callback__exit(
+  void *env,
+  wasmtime_caller_t* caller,
+  wasmtime_val_raw_t *args_and_results,
+  size_t args_and_results_len
+) {
+  printf("exit called");
+  abort();
+}
 
 static wasm_trap_t *callback__lexer_advance(
   void *env,
@@ -259,6 +361,7 @@ TSWasmStore *ts_wasm_store_new(TSWasmEngine *engine) {
   wasmtime_store_t *store = wasmtime_store_new(engine, self, NULL);
   wasmtime_context_t *context = wasmtime_store_context(store);
   wasmtime_error_t *error = NULL;
+  wasm_trap_t *trap = NULL;
 
   // Initialize store's memory
   wasm_limits_t memory_limits = {.min = LEXER_END_ADDRESS, .max = wasm_limits_max_default};
@@ -283,6 +386,7 @@ TSWasmStore *ts_wasm_store_new(TSWasmEngine *engine) {
 
   // Define builtin functions.
   FunctionDefinition definitions[] = {
+    [PROC_EXIT_IX] = {callback__exit, wasm_functype_new_1_0(wasm_valtype_new_i32())},
     [LEXER_ADVANCE_IX] = {callback__lexer_advance, wasm_functype_new_2_0(wasm_valtype_new_i32(), wasm_valtype_new_i32())},
     [LEXER_MARK_END_IX] = {callback__lexer_mark_end, wasm_functype_new_1_0(wasm_valtype_new_i32())},
     [LEXER_GET_COLUMN_IX] = {callback__lexer_get_column, wasm_functype_new_1_1(wasm_valtype_new_i32(), wasm_valtype_new_i32())},
@@ -316,6 +420,34 @@ TSWasmStore *ts_wasm_store_new(TSWasmEngine *engine) {
     assert(!error);
     wasm_functype_delete(definition->type);
   }
+
+  WasmDylinkMemoryInfo memory_info;
+  wasmtime_module_t *stdlib_module;
+  if (!parse_wasm_dylink_memory_info(STDLIB_WASM, STDLIB_WASM_LEN, &memory_info)) abort();
+  error = wasmtime_module_new(engine, STDLIB_WASM, STDLIB_WASM_LEN, &stdlib_module);
+  assert(!error);
+  printf("memory info: %u, %u", memory_info.memory_size, memory_info.table_size);
+
+  wasmtime_instance_t instance;
+  wasmtime_extern_t import = get_builtin_func_extern(context, &function_table, PROC_EXIT_IX);
+  error = wasmtime_instance_new(context, stdlib_module, &import, 1, &instance, &trap);
+  if (error) {
+    wasm_message_t message;
+    wasmtime_error_message(error, &message);
+    printf("error compiling standard library: %.*s\n", (int)message.size, message.data);
+    abort();
+  }
+  assert(!error);
+
+  // Process the stdlib module's exports.
+  wasm_exporttype_vec_t export_types = WASM_EMPTY_VEC;
+  wasmtime_module_exports(stdlib_module, &export_types);
+  for (unsigned i = 0; i < export_types.size; i++) {
+    wasm_exporttype_t *export_type = export_types.data[i];
+    const wasm_name_t *name = wasm_exporttype_name(export_type);
+    printf("  stdlib name: %.*s\n", (int)name->size, name->data);
+  }
+  wasm_exporttype_vec_delete(&export_types);
 
   *self = (TSWasmStore) {
     .store = store,
